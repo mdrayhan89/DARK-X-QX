@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import asyncio
-import threading
 import time
 import json
 import os
 import sys
 import certifi
-from flask import Flask, render_template_string, request, jsonify
-from flask_socketio import SocketIO, emit
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from typing import Optional, Dict, List
 
-# ✅ SSL Force Setup for Render Linux Container
+# ✅ SSL Certificates Force Fix for Render Cloud Environment
 cert_path = certifi.where()
 os.environ['SSL_CERT_FILE'] = cert_path
 os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = cert_path
@@ -23,16 +21,7 @@ except ImportError:
     print("Run: pip install git+https://github.com/cleitonleonel/pyquotex.git@master")
     sys.exit(1)
 
-app = Flask(__name__)
-# ✅ Switched to ultra-stable native threading mode for full asyncio compatibility
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-
-ASYNC_LOOP = asyncio.new_event_loop()
-def start_async_loop():
-    asyncio.set_event_loop(ASYNC_LOOP)
-    ASYNC_LOOP.run_forever()
-
-threading.Thread(target=start_async_loop, daemon=True).start()
+app = FastAPI()
 
 CLIENT: Optional[Quotex] = None
 CURRENT_ASSET = "AUD/CAD (OTC)"
@@ -41,8 +30,10 @@ CANDLES: Dict[str, Dict[str, List[dict]]] = {}
 CURRENT_CANDLE: Dict[str, Dict[str, dict]] = {}
 LOGIN_SUCCESS = False
 REALTIME_RUNNING = False
+ACTIVE_TASK: Optional[asyncio.Task] = None
+ACTIVE_CONNECTIONS = set()
 
-# ✅ ALL ASSET PAIRS MATCHED FROM YOUR ORIGINAL SOURCE FILE
+# ✅ ALL ASSET PAIRS
 forex_assets = {
     "AUDCAD": "AUD/CAD", "AUDCAD_otc": "AUD/CAD (OTC)", "AUDCHF": "AUD/CHF", "AUDCHF_otc": "AUD/CHF (OTC)",
     "AUDJPY": "AUD/JPY", "AUDJPY_otc": "AUD/JPY (OTC)", "AUDNZD_otc": "AUD/NZD (OTC)", "AUDUSD": "AUD/USD",
@@ -115,19 +106,10 @@ def update_candle(asset: str, frame: str, price: float, ts_sec: int):
         if price < curr["low"]: curr["low"] = float(price)
         curr["close"] = float(price)
 
-def send_to_socket(asset: str, timeframe: str):
-    all_candles = CANDLES.get(asset, {}).get(timeframe, []).copy()
-    curr = CURRENT_CANDLE.get(asset, {}).get(timeframe)
-    if curr:
-        if all_candles and all_candles[-1]["time"] == curr["time"]: all_candles[-1] = curr
-        else: all_candles.append(curr)
-    socketio.emit('updateChart', {'candles': all_candles, 'asset': asset, 'timeframe': timeframe})
-
 async def realtime_price_loop(asset_display: str):
     global REALTIME_RUNNING
     internal = DISPLAY_TO_INTERNAL.get(asset_display)
     if not internal or not CLIENT: return
-    REALTIME_RUNNING = True
     while REALTIME_RUNNING:
         try:
             data = await CLIENT.get_realtime_price(internal)
@@ -138,41 +120,47 @@ async def realtime_price_loop(asset_display: str):
                 ts_sec = int(float(timestamp))
                 for frame in TIMEFRAMES:
                     update_candle(asset_display, frame, price, ts_sec)
-                send_to_socket(asset_display, CURRENT_TIMEFRAME)
+                
+                all_candles = CANDLES.get(asset_display, {}).get(CURRENT_TIMEFRAME, []).copy()
+                curr = CURRENT_CANDLE.get(asset_display, {}).get(CURRENT_TIMEFRAME)
+                if curr:
+                    if all_candles and all_candles[-1]["time"] == curr["time"]: all_candles[-1] = curr
+                    else: all_candles.append(curr)
+                
+                # Broadcast updates to web clients using native async sockets
+                payload = json.dumps({"type": "updateChart", "candles": all_candles, "asset": asset_display, "timeframe": CURRENT_TIMEFRAME})
+                for ws in list(ACTIVE_CONNECTIONS):
+                    try:
+                        await ws.send_text(payload)
+                    except Exception:
+                        ACTIVE_CONNECTIONS.discard(ws)
             await asyncio.sleep(0.4)
+        except asyncio.CancelledError:
+            break
         except Exception:
             await asyncio.sleep(1)
 
-# ✅ REAL NON-RANDOM MULTI-TARGET FUTURE SEQUENTIAL CALCULATOR
 def generate_live_future_signals(asset, timeframe):
     all_candles = CANDLES.get(asset, {}).get(timeframe, [])
     if len(all_candles) < 2:
         return {"status": "error", "message": "API context initializing. Streaming asset data, try clicking again in 10s..."}
-    
     last = all_candles[-1]
     prev = all_candles[-2]
-    
     is_bullish = last['close'] > last['open'] or (last['close'] == last['open'] and prev['close'] > prev['open'])
     direction = "CALL (BUY) 🟢" if is_bullish else "PUT (SELL) 🔴"
     opposite_direction = "PUT (SELL) 🔴" if is_bullish else "CALL (BUY) 🟢"
-    
     current_time_sec = int(time.time())
     duration_sec = TIMEFRAMES.get(timeframe, 60)
-    
     next_signal_time = ((current_time_sec // duration_sec) + 1) * duration_sec
-    future_time_str = time.strftime('%H:%M:%S', time.localtime(next_signal_time))
-    future_time_str_2 = time.strftime('%H:%M:%S', time.localtime(next_signal_time + duration_sec))
-
     return {
         "status": "success", "asset": asset, "timeframe": timeframe,
         "signals": [
             {"type": "LIVE ACTIVE SIGNAL", "time": time.strftime('%H:%M:%S'), "direction": direction, "accuracy": "91%"},
-            {"type": "FUTURE TARGET 1", "time": future_time_str, "direction": direction, "accuracy": "84%"},
-            {"type": "FUTURE TARGET 2", "time": future_time_str_2, "direction": opposite_direction, "accuracy": "76%"}
+            {"type": "FUTURE TARGET 1", "time": time.strftime('%H:%M:%S', time.localtime(next_signal_time)), "direction": direction, "accuracy": "84%"},
+            {"type": "FUTURE TARGET 2", "time": time.strftime('%H:%M:%S', time.localtime(next_signal_time + duration_sec)), "direction": opposite_direction, "accuracy": "76%"}
         ]
     }
 
-# ✅ SINGLE EMBEDDED VIEW TEMPLATE
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -180,7 +168,6 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Quotex Live Realtime Signal Engine</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <style>
         body { background: #070b1e; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; margin: 0; }
         .wrapper { max-width: 600px; margin: 30px auto; }
@@ -207,7 +194,7 @@ HTML_TEMPLATE = """
     </div>
     <div class="box" id="controlBox" style="display:none;">
         <h3>⚙️ Market Configuration</h3>
-        <label>Select Target Asset (All Pairs Loaded):</label>
+        <label>Select Target Asset:</label>
         <select id="assetSelect" onchange="changeAsset()"></select>
         <label>Select Timeframe:</label>
         <select id="tfSelect" onchange="changeTimeframe()">
@@ -224,18 +211,28 @@ HTML_TEMPLATE = """
     </div>
 </div>
 <script>
-    // Forced long-polling transport layer to ensure maximum stability over Render
-    let socket = io({transports: ['polling']});
-    
+    let socket;
+    function connectWebSocket() {
+        let protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        socket = new WebSocket(protocol + window.location.host + '/ws');
+        socket.onmessage = function(event) {
+            let data = JSON.parse(event.data);
+            if (data.type === 'updateChart') {
+                document.getElementById('streamStatus').innerHTML = `🟢 WebSocket Synced | Live stream for ${data.asset} (${data.timeframe})`;
+            }
+        };
+        socket.onclose = function() {
+            document.getElementById('streamStatus').innerHTML = `❌ WebSocket Disconnected. Reconnecting...`;
+            setTimeout(connectWebSocket, 2000);
+        };
+    }
     window.onload = function() {
-        fetch('/api/get_assets_list')
-        .then(res => res.json())
-        .then(data => {
+        connectWebSocket();
+        fetch('/api/get_assets_list').then(res => res.json()).then(data => {
             let select = document.getElementById('assetSelect');
             let all = [...data.forex, ...data.crypto, ...data.commodities, ...data.stocks, ...data.indices];
             all.forEach(asset => {
-                let opt = document.createElement('option');
-                opt.value = asset; opt.innerHTML = asset; select.appendChild(opt);
+                let opt = document.createElement('option'); opt.value = asset; opt.innerHTML = asset; select.appendChild(opt);
             });
         });
     };
@@ -253,116 +250,99 @@ HTML_TEMPLATE = """
                 document.getElementById('loginBox').style.display = 'none';
                 document.getElementById('controlBox').style.display = 'block';
                 changeAsset();
-            } else { 
-                alert(data.message); btn.innerHTML = "Connect Quotex Engine"; btn.disabled = false;
-            }
+            } else { alert(data.message); btn.innerHTML = "Connect Quotex Engine"; btn.disabled = false; }
         });
     }
     function changeAsset() {
         let asset = document.getElementById('assetSelect').value;
         document.getElementById('streamStatus').innerHTML = "Switching stream target to " + asset + "...";
-        fetch('/api/start_stream', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({asset})
-        });
+        fetch('/api/start_stream', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({asset}) });
     }
     function changeTimeframe() {
         let tf = document.getElementById('tfSelect').value;
-        fetch('/api/change_tf', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({timeframe: tf})
-        });
+        fetch('/api/change_tf', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({timeframe: tf}) });
     }
     function fetchSignal() {
         let container = document.getElementById('signalsContainer');
         container.innerHTML = "Processing structural formula parameters...";
-        fetch('/api/get_signal', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'}
-        }).then(res => res.json()).then(data => {
+        fetch('/api/get_signal', { method: 'POST', headers: {'Content-Type': 'application/json'} }).then(res => res.json()).then(data => {
             if(data.status === 'success') {
                 container.innerHTML = "";
                 data.signals.forEach(s => {
-                    container.innerHTML += `<div class="sig-item">
-                        <strong>[${s.type}]</strong> Target Time: ${s.time}<br>
-                        Execution Target: <b>${s.direction}</b> (Math Probability: ${s.accuracy})
-                    </div>`;
+                    container.innerHTML += `<div class="sig-item"><strong>[${s.type}]</strong> Target Time: ${s.time}<br>Execution Target: <b>${s.direction}</b> (Math Probability: ${s.accuracy})</div>`;
                 });
-            } else { container.innerHTML = `<span style="color:#ef4444">${data.message}</span>`; }
+            } else { container.innerHTML = `<span style="color:#ef4444">\${data.message}</span>`; }
         });
     }
-    socket.on('updateChart', function(data) {
-        document.getElementById('streamStatus').innerHTML = `🟢 WebSocket Synced | Live stream for ${data.asset} (${data.timeframe})`;
-    });
 </script>
 </body>
 </html>
 """
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+@app.get('/', response_class=HTMLResponse)
+async def index():
+    return HTML_TEMPLATE
 
-@app.route('/api/get_assets_list', methods=['GET'])
-def get_assets_list():
-    return jsonify({"forex": list(forex_assets.values()), "crypto": list(crypto_assets.values()), "commodities": list(commodities_assets.values()), "stocks": list(stocks_assets.values()), "indices": list(indices_assets.values())})
+@app.get('/api/get_assets_list')
+async def get_assets_list():
+    return {"forex": list(forex_assets.values()), "crypto": list(crypto_assets.values()), "commodities": list(commodities_assets.values()), "stocks": list(stocks_assets.values()), "indices": list(indices_assets.values())}
 
-@app.route('/api/login', methods=['POST'])
-def api_login():
+@app.post('/api/login')
+async def api_login(data: dict):
     global CLIENT, LOGIN_SUCCESS
-    data = request.json
-    email = data.get("email")
-    password = data.get("password")
-    
-    async def connect():
-        global CLIENT, LOGIN_SUCCESS
-        CLIENT = Quotex(email=email, password=password, host="qxbroker.com", lang="en")
+    try:
+        CLIENT = Quotex(email=data.get("email"), password=data.get("password"), host="qxbroker.com", lang="en")
         success, reason = await CLIENT.connect()
         if success:
             await CLIENT.change_account("PRACTICE")
             LOGIN_SUCCESS = True
-            return True
-        return False
+            return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "error", "message": "Handshake failed. Check credentials."}
 
-    future = asyncio.run_coroutine_threadsafe(connect(), ASYNC_LOOP)
-    try:
-        if future.result(timeout=45):
-            return jsonify({"status": "success"})
-    except Exception:
-        pass
-    return jsonify({"status": "error", "message": "Handshake failed. Check credentials."})
-
-@app.route('/api/start_stream', methods=['POST'])
-def start_stream():
-    global CURRENT_ASSET, REALTIME_RUNNING
-    data = request.json
+@app.post('/api/start_stream')
+async def start_stream(data: dict):
+    global CURRENT_ASSET, REALTIME_RUNNING, ACTIVE_TASK
     asset = data.get("asset")
     CURRENT_ASSET = asset
-    
-    async def run_stream():
-        global REALTIME_RUNNING
-        REALTIME_RUNNING = False
-        await asyncio.sleep(0.5)
-        internal = DISPLAY_TO_INTERNAL.get(asset)
-        await CLIENT.start_realtime_price(internal, 60)
-        asyncio.create_task(realtime_price_loop(asset))
-        
-    asyncio.run_coroutine_threadsafe(run_stream(), ASYNC_LOOP)
-    return jsonify({"status": "started"})
+    REALTIME_RUNNING = False
+    if ACTIVE_TASK:
+        ACTIVE_TASK.cancel()
+        try:
+            await ACTIVE_TASK
+        except asyncio.CancelledError:
+            pass
+    internal = DISPLAY_TO_INTERNAL.get(asset)
+    if CLIENT and internal:
+        REALTIME_RUNNING = True
+        ACTIVE_TASK = asyncio.create_task(realtime_price_loop(asset))
+    return {"status": "started"}
 
-@app.route('/api/change_tf', methods=['POST'])
-def change_tf():
+@app.post('/api/change_tf')
+async def change_tf(data: dict):
     global CURRENT_TIMEFRAME
-    CURRENT_TIMEFRAME = request.json.get("timeframe", "1m")
-    return jsonify({"status": "changed"})
+    CURRENT_TIMEFRAME = data.get("timeframe", "1m")
+    return {"status": "changed"}
 
-@app.route('/api/get_signal', methods=['POST'])
-def get_signal():
-    if not LOGIN_SUCCESS: return jsonify({"status": "error", "message": "Quotex instance session inactive."})
-    return jsonify(generate_live_future_signals(CURRENT_ASSET, CURRENT_TIMEFRAME))
+@app.post('/api/get_signal')
+async def get_signal():
+    if not LOGIN_SUCCESS: return {"status": "error", "message": "Quotex instance session inactive."}
+    return generate_live_future_signals(CURRENT_ASSET, CURRENT_TIMEFRAME)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    ACTIVE_CONNECTIONS.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ACTIVE_CONNECTIONS.discard(websocket)
+    except Exception:
+        ACTIVE_CONNECTIONS.discard(websocket)
 
 if __name__ == '__main__':
+    import uvicorn
     port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
+    uvicorn.run(app, host='0.0.0.0', port=port)

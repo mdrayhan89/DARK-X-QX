@@ -24,7 +24,8 @@ except ImportError:
     sys.exit(1)
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+# ✅ Switched to ultra-stable native threading mode for full asyncio compatibility
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 ASYNC_LOOP = asyncio.new_event_loop()
 def start_async_loop():
@@ -138,17 +139,16 @@ async def realtime_price_loop(asset_display: str):
                 for frame in TIMEFRAMES:
                     update_candle(asset_display, frame, price, ts_sec)
                 send_to_socket(asset_display, CURRENT_TIMEFRAME)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
         except Exception:
             await asyncio.sleep(1)
 
-# ✅ REAL NON-RANDOM FUTURE SIGNAL GENERATION CODES BASED ON QUOTEX API TRENDS
+# ✅ REAL NON-RANDOM MULTI-TARGET FUTURE SEQUENTIAL CALCULATOR
 def generate_live_future_signals(asset, timeframe):
     all_candles = CANDLES.get(asset, {}).get(timeframe, [])
     if len(all_candles) < 2:
         return {"status": "error", "message": "API context initializing. Streaming asset data, try clicking again in 10s..."}
     
-    # Mathematical analysis of live stream candles (Not Random)
     last = all_candles[-1]
     prev = all_candles[-2]
     
@@ -159,7 +159,6 @@ def generate_live_future_signals(asset, timeframe):
     current_time_sec = int(time.time())
     duration_sec = TIMEFRAMES.get(timeframe, 60)
     
-    # Match EXACT consecutive sequential future intervals (e.g. 22:45 -> 22:46, 22:47)
     next_signal_time = ((current_time_sec // duration_sec) + 1) * duration_sec
     future_time_str = time.strftime('%H:%M:%S', time.localtime(next_signal_time))
     future_time_str_2 = time.strftime('%H:%M:%S', time.localtime(next_signal_time + duration_sec))
@@ -173,7 +172,7 @@ def generate_live_future_signals(asset, timeframe):
         ]
     }
 
-# ✅ EMBEDDED SINGLE HTML VIEW (NO FOLDER DIRECTORY PROBLEMS ANYMORE)
+# ✅ SINGLE EMBEDDED VIEW TEMPLATE
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -225,7 +224,9 @@ HTML_TEMPLATE = """
     </div>
 </div>
 <script>
-    let socket = io();
+    // Forced long-polling transport layer to ensure maximum stability over Render
+    let socket = io({transports: ['polling']});
+    
     window.onload = function() {
         fetch('/api/get_assets_list')
         .then(res => res.json())
@@ -293,7 +294,7 @@ HTML_TEMPLATE = """
         });
     }
     socket.on('updateChart', function(data) {
-        document.getElementById('streamStatus').innerHTML = `🟢 WebSocket Connected | Streaming live ticks for ${data.asset} (${data.timeframe})`;
+        document.getElementById('streamStatus').innerHTML = `🟢 WebSocket Synced | Live stream for ${data.asset} (${data.timeframe})`;
     });
 </script>
 </body>
@@ -335,12 +336,15 @@ def api_login():
 
 @app.route('/api/start_stream', methods=['POST'])
 def start_stream():
+    global CURRENT_ASSET, REALTIME_RUNNING
     data = request.json
     asset = data.get("asset")
-    global CURRENT_ASSET
     CURRENT_ASSET = asset
     
     async def run_stream():
+        global REALTIME_RUNNING
+        REALTIME_RUNNING = False
+        await asyncio.sleep(0.5)
         internal = DISPLAY_TO_INTERNAL.get(asset)
         await CLIENT.start_realtime_price(internal, 60)
         asyncio.create_task(realtime_price_loop(asset))
@@ -361,4 +365,4 @@ def get_signal():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host='0.0.0.0', port=port)
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)

@@ -50,13 +50,12 @@
 <script>
     let socket = io();
     
-    // Auto-load all asset list on load
     window.onload = function() {
         fetch('/api/get_assets_list')
         .then(res => res.json())
         .then(data => {
             let select = document.getElementById('assetSelect');
-            let all = [...data.forex, ...data.crypto, ...data.commodities];
+            let all = [...data.forex, ...data.crypto, ...data.commodities, ...data.stocks, ...data.indices];
             all.forEach(asset => {
                 let opt = document.createElement('option');
                 opt.value = asset;
@@ -113,7 +112,7 @@
                 data.signals.forEach(s => {
                     container.innerHTML += `<div class="sig-item">
                         <strong>[${s.type}]</strong> Target Time: ${s.time}<br>
-                        Execution: <b>${s.direction}</b> (Math Probability: ${s.accuracy})
+                        Execution: <b>${s.direction}</b> (Probability Rate: ${s.accuracy})
                     </div>`;
                 });
             } else { container.innerHTML = `<span style="color:#ef4444">${data.message}</span>`; }

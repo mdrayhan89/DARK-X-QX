@@ -1,5 +1,4 @@
 Flask
 flask-socketio
-gunicorn
-eventlet
-git+https://github.com/cleitonleonel/pyquotex.git@master
+certifi
+pyquotex @ git+https://github.com/cleitonleonel/pyquotex.git@master
